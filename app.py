@@ -47,13 +47,40 @@ def audit(actor, action, object_type=None, object_id=None, details=None):
     con=db(); con.execute('INSERT INTO audit_log(actor,action,object_type,object_id,details,created_at) VALUES(?,?,?,?,?,?)', (actor,action,object_type,str(object_id) if object_id is not None else None, json.dumps(details or {}, ensure_ascii=False),now_iso())); con.commit(); con.close()
 
 def tg(method, payload):
-    if not BOT_TOKEN: return None
-    try:
-        r=requests.post(f'https://api.telegram.org/bot{BOT_TOKEN}/{method}', json=payload, timeout=8)
-        r.raise_for_status(); return r.json()
-    except requests.RequestException:
-        app.logger.exception('Telegram API call failed')
+   
+def tg(method, payload):
+    if not BOT_TOKEN:
+        app.logger.error("Telegram API call skipped: BOT_TOKEN is missing")
         return None
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            json=payload,
+            timeout=8
+        )
+
+        try:
+            result = r.json()
+        except ValueError:
+            result = {"description": r.text[:500]}
+
+        if not r.ok or not result.get("ok", False):
+            app.logger.error(
+                "Telegram API %s failed: HTTP %s; response=%s",
+                method, r.status_code, result
+            )
+        else:
+            app.logger.info("Telegram API %s succeeded", method)
+
+        return result
+
+    except requests.RequestException:
+        app.logger.exception(
+            "Telegram API request failed for method %s", method
+        )
+        return None
+
 
 def send_message(chat_id, text, reply_markup=None):
     data={'chat_id':chat_id,'text':text,'disable_web_page_preview':True}
