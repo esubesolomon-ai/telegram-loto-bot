@@ -46,9 +46,7 @@ def init_db():
 def audit(actor, action, object_type=None, object_id=None, details=None):
     con=db(); con.execute('INSERT INTO audit_log(actor,action,object_type,object_id,details,created_at) VALUES(?,?,?,?,?,?)', (actor,action,object_type,str(object_id) if object_id is not None else None, json.dumps(details or {}, ensure_ascii=False),now_iso())); con.commit(); con.close()
 
-def tg(method, payload):
-   
-def tg(method, payload):
+  def tg(method, payload):
     if not BOT_TOKEN:
         app.logger.error("Telegram API call skipped: BOT_TOKEN is missing")
         return None
