@@ -1,330 +1,785 @@
 """Telegram lottery bot starter. Payments and live draws are disabled by default."""
+
 import os
 import json
 import hmac
-import logging
+import hashlib
 import secrets
 import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from functools import wraps
 
-import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+import requests
+from flask import Flask, request, session, redirect, url_for, render_template, flash, abort
+from werkzeug.security import generate_password_hash, check_password_hash
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-log = logging.getLogger("lottery-bot")
+APP_SECRET = os.environ.get("APP_SECRET", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+DB_PATH = os.environ.get("DB_PATH", "lottery.db")
+DEMO_MODE = os.environ.get("DEMO_MODE", "true").lower() != "false"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-DB_PATH = os.getenv("DB_PATH", "./data/lottery.sqlite3")
-TELEBIRR_ENABLED = os.getenv("TELEBIRR_ENABLED", "false").lower() == "true"
-LIVE_DRAWS_ENABLED = os.getenv("LIVE_DRAWS_ENABLED", "false").lower() == "true"
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+app = Flask(__name__)
+app.secret_key = APP_SECRET or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "true").lower() == "true",
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
+    MAX_CONTENT_LENGTH=1024 * 1024,
+)
 
-app = FastAPI(title="Telegram Lottery Bot", version="1.0.0")
+PRICES = {"daily": 100, "weekly": 50, "monthly": 50}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS admins (
+ id INTEGER PRIMARY KEY,
+ username TEXT UNIQUE NOT NULL,
+ password_hash TEXT NOT NULL,
+ role TEXT NOT NULL DEFAULT 'owner',
+ active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS players (
+ id INTEGER PRIMARY KEY,
+ telegram_id INTEGER UNIQUE NOT NULL,
+ username TEXT,
+ first_name TEXT,
+ created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+ key TEXT PRIMARY KEY,
+ value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS draws (
+ id INTEGER PRIMARY KEY,
+ draw_type TEXT NOT NULL,
+ title TEXT NOT NULL,
+ price INTEGER NOT NULL,
+ status TEXT NOT NULL DEFAULT 'open',
+ closes_at TEXT NOT NULL,
+ winning_number TEXT,
+ seed_commitment TEXT,
+ seed_reveal TEXT,
+ created_at TEXT NOT NULL,
+ closed_at TEXT,
+ drawn_at TEXT
+);
+CREATE TABLE IF NOT EXISTS tickets (
+ id INTEGER PRIMARY KEY,
+ ticket_code TEXT UNIQUE NOT NULL,
+ draw_id INTEGER NOT NULL REFERENCES draws(id),
+ player_id INTEGER NOT NULL REFERENCES players(id),
+ number TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'demo',
+ created_at TEXT NOT NULL,
+ UNIQUE(draw_id, number)
+);
+CREATE TABLE IF NOT EXISTS ledger (
+ id INTEGER PRIMARY KEY,
+ entry_type TEXT NOT NULL,
+ amount INTEGER NOT NULL,
+ currency TEXT NOT NULL DEFAULT 'ETB',
+ status TEXT NOT NULL,
+ reference TEXT UNIQUE NOT NULL,
+ player_id INTEGER,
+ ticket_id INTEGER,
+ notes TEXT,
+ created_at TEXT NOT NULL,
+ created_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+ id INTEGER PRIMARY KEY,
+ actor TEXT NOT NULL,
+ action TEXT NOT NULL,
+ object_type TEXT,
+ object_id TEXT,
+ details TEXT,
+ created_at TEXT NOT NULL
+);
+"""
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect_db():
-    folder = os.path.dirname(DB_PATH)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    con = sqlite3.connect(DB_PATH, timeout=20)
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA foreign_keys=ON")
     return con
 
 
-@contextmanager
-def db():
-    con = connect_db()
+def init_db():
+    con = db()
+    con.executescript(SCHEMA)
+    con.execute(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES"
+        "('terms_version','1.0'),"
+        "('draw_policy','No rerolls if no ticket matches.'),"
+        "('demo_mode',?)",
+        ("true" if DEMO_MODE else "false",),
+    )
+    if ADMIN_PASSWORD:
+        con.execute(
+            "INSERT OR IGNORE INTO admins(username,password_hash,role) VALUES(?,?,?)",
+            (ADMIN_USERNAME, generate_password_hash(ADMIN_PASSWORD), "owner"),
+        )
+    con.commit()
+    con.close()
+
+
+def audit(actor, action, object_type=None, object_id=None, details=None):
+    con = db()
+    con.execute(
+        "INSERT INTO audit_log(actor,action,object_type,object_id,details,created_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (
+            actor, action, object_type,
+            str(object_id) if object_id is not None else None,
+            json.dumps(details or {}, ensure_ascii=False), now_iso()
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+# Telegram API: log the actual result, never log the bot token.
+def tg(method, payload):
+    if not BOT_TOKEN:
+        app.logger.error("Telegram API call skipped: BOT_TOKEN is missing")
+        return None
+
     try:
-        yield con
-        con.commit()
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            json=payload,
+            timeout=10,
+        )
+
+        try:
+            result = response.json()
+        except ValueError:
+            result = {"description": response.text[:300]}
+
+        if not response.ok or not result.get("ok", False):
+            app.logger.error(
+                "Telegram API %s failed: HTTP %s; code=%s; description=%s",
+                method,
+                response.status_code,
+                result.get("error_code", "unknown"),
+                result.get("description", "No description"),
+            )
+        else:
+            app.logger.info("Telegram API %s succeeded", method)
+
+        return result
+
+    except requests.RequestException as exc:
+        app.logger.error(
+            "Telegram request failed: method=%s error_type=%s",
+            method, type(exc).__name__
+        )
+        app.logger.exception("Telegram API request traceback")
+        return None
+
+
+def send_message(chat_id, text, reply_markup=None):
+    data = {
+        "chat_id": chat_id,
+        "text": str(text)[:4000],
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+
+    result = tg("sendMessage", data)
+    if result is None:
+        app.logger.error("sendMessage returned no response")
+    elif not result.get("ok", False):
+        app.logger.error(
+            "sendMessage rejected: code=%s description=%s",
+            result.get("error_code", "unknown"),
+            result.get("description", "No description"),
+        )
+    return result
+
+
+def main_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "🎟 Buy demo ticket"}, {"text": "📋 My tickets"}],
+            [{"text": "🎲 Available draws"}, {"text": "📜 Rules"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def active_draws():
+    con = db()
+    rows = con.execute(
+        "SELECT * FROM draws WHERE status='open' AND closes_at>? ORDER BY closes_at",
+        (now_iso(),),
+    ).fetchall()
+    con.close()
+    return rows
+
+
+def draw_text(draw):
+    deadline = draw["closes_at"].replace("T", " ")[:16] + " UTC"
+    return (
+        f"{draw['title']}\n"
+        f"Ticket price: {draw['price']} ETB (DEMO only)\n"
+        f"Closes: {deadline}\n"
+        f"Status: {draw['status'].upper()}\n"
+        f"Draw ID: {draw['id']}"
+    )
+
+
+def player_upsert(user):
+    con = db()
+    con.execute(
+        "INSERT INTO players(telegram_id,username,first_name,created_at) "
+        "VALUES(?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET "
+        "username=excluded.username, first_name=excluded.first_name",
+        (
+            user["id"], user.get("username"),
+            user.get("first_name", "Player"), now_iso()
+        ),
+    )
+    con.commit()
+    row = con.execute(
+        "SELECT id FROM players WHERE telegram_id=?", (user["id"],)
+    ).fetchone()
+    con.close()
+    return row["id"]
+
+
+def rules_text():
+    return (
+        "ETHIO LOTTERY — DEMO RULES\n\n"
+        "This is a demonstration. No real payments are accepted and no cash prizes are paid.\n"
+        "Daily ticket: 100 ETB (display only). Weekly: 50 ETB. Monthly: 50 ETB.\n"
+        "Each ticket has a six-digit number from 000000 to 999999.\n"
+        "Numbers are unique within each draw. The winning number is selected after the draw closes.\n"
+        "Real-money play requires legal authorization, approved payments, published rules, "
+        "eligibility controls, and reliable persistent storage."
+    )
+
+
+def handle_update(update):
+    msg = update.get("message")
+    if not msg:
+        app.logger.info("Update received without a message")
+        return
+
+    user = msg.get("from", {})
+    chat_id = msg.get("chat", {}).get("id")
+    text = (msg.get("text") or "").strip()
+
+    if not chat_id or not user.get("id"):
+        app.logger.warning("Incoming message missing chat/user ID")
+        return
+
+    app.logger.info(
+        "Handling Telegram message; command=%s; chat_type=%s",
+        text.split(" ", 1)[0][:40] if text else "(no text)",
+        msg.get("chat", {}).get("type", "unknown"),
+    )
+
+    try:
+        pid = player_upsert(user)
     except Exception:
-        con.rollback()
-        raise
-    finally:
+        app.logger.exception("Could not save Telegram player")
+        send_message(chat_id, "Temporary database problem. Please try again later.")
+        return
+
+    if text.startswith("/start"):
+        send_message(
+            chat_id,
+            "Welcome to Ethio Lottery Demo. No money is collected and no cash prizes are paid in this test version. Choose an option below.",
+            main_keyboard(),
+        )
+        return
+
+    if text in ["/rules", "📜 Rules"]:
+        send_message(chat_id, rules_text(), main_keyboard())
+        return
+
+    if text in ["/draws", "🎲 Available draws"]:
+        rows = active_draws()
+        message = (
+            "\n\n".join(draw_text(r) for r in rows)
+            if rows else "There are no open draws right now. Please check again later."
+        )
+        send_message(chat_id, message, main_keyboard())
+        return
+
+    if text in ["/mytickets", "📋 My tickets"]:
+        con = db()
+        rows = con.execute(
+            "SELECT t.ticket_code,t.number,t.status,d.title,d.winning_number "
+            "FROM tickets t JOIN draws d ON d.id=t.draw_id "
+            "WHERE t.player_id=? ORDER BY t.id DESC LIMIT 20",
+            (pid,),
+        ).fetchall()
         con.close()
 
-
-def init_db():
-    with db() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS draws (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          title TEXT NOT NULL,
-          ticket_price_minor INTEGER NOT NULL CHECK(ticket_price_minor >= 0),
-          currency TEXT NOT NULL DEFAULT 'ETB',
-          prize_description TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed','completed')),
-          created_by INTEGER NOT NULL,
-          created_at TEXT NOT NULL,
-          closes_at TEXT,
-          winner_ticket_id INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS payments (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          provider TEXT NOT NULL,
-          provider_order_id TEXT NOT NULL UNIQUE,
-          telegram_user_id INTEGER NOT NULL,
-          draw_id INTEGER NOT NULL REFERENCES draws(id),
-          amount_minor INTEGER NOT NULL,
-          currency TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid','failed','refunded')),
-          provider_transaction_id TEXT UNIQUE,
-          verified_at TEXT,
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS tickets (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          public_code TEXT NOT NULL UNIQUE,
-          draw_id INTEGER NOT NULL REFERENCES draws(id),
-          telegram_user_id INTEGER NOT NULL,
-          payment_id INTEGER UNIQUE REFERENCES payments(id),
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          actor_id INTEGER,
-          action TEXT NOT NULL,
-          details_json TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets(telegram_user_id, draw_id);
-        CREATE INDEX IF NOT EXISTS idx_tickets_draw ON tickets(draw_id);
-        """)
-
-
-init_db()
-
-
-def audit(actor_id: Optional[int], action: str, details: dict):
-    with db() as con:
-        con.execute("INSERT INTO audit_log(actor_id,action,details_json,created_at) VALUES(?,?,?,?)",
-                    (actor_id, action, json.dumps(details, ensure_ascii=False), now_iso()))
-
-
-async def telegram_api(method: str, payload: dict):
-    if not BOT_TOKEN:
-        log.error("BOT_TOKEN is not configured")
-        return {"ok": False, "description": "BOT_TOKEN is not configured"}
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(url, json=payload)
-            data = response.json()
-            if response.status_code >= 400 or not data.get("ok"):
-                log.error("Telegram API failure method=%s status=%s response=%s", method, response.status_code, data)
-            return data
-    except Exception:
-        log.exception("Telegram API request failed method=%s", method)
-        return {"ok": False, "description": "Telegram API request failed"}
-
-
-async def send_message(chat_id: int, text: str):
-    return await telegram_api("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
-
-
-def money(minor: int, currency: str) -> str:
-    return f"{minor / 100:,.2f} {currency}"
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-def list_open_draws():
-    with db() as con:
-        return con.execute("SELECT * FROM draws WHERE status='open' ORDER BY id DESC LIMIT 20").fetchall()
-
-
-def draw_summary(draw) -> str:
-    with db() as con:
-        count = con.execute("SELECT COUNT(*) AS n FROM tickets WHERE draw_id=?", (draw["id"],)).fetchone()["n"]
-    return (f"#{draw['id']} — {draw['title']}\nTicket price: {money(draw['ticket_price_minor'], draw['currency'])}\n"
-            f"Prize: {draw['prize_description']}\nTickets issued: {count}\nStatus: {draw['status']}")
-
-
-async def handle_update(update: dict):
-    message = update.get("message") or update.get("edited_message")
-    if not message or not message.get("chat") or not message.get("from"):
-        return
-    chat_id = int(message["chat"]["id"])
-    user_id = int(message["from"]["id"])
-    text = (message.get("text") or "").strip()
-    if not text:
-        return
-    command = text.split()[0].split("@")[0].lower()
-
-    if command in ("/start", "/help"):
-        await send_message(chat_id,
-            "Welcome to the lottery bot.\n\n/lottery — view open draws\n/tickets — view your tickets\n/help — commands\n\n"
-            "Payments are not enabled in this installation. Never send money until the operator announces an approved, verified payment method.")
-        return
-
-    if command == "/lottery":
-        draws = list_open_draws()
-        if not draws:
-            await send_message(chat_id, "There are no open draws right now.")
-        else:
-            await send_message(chat_id, "Open draws:\n\n" + "\n\n".join(draw_summary(d) for d in draws) +
-                                "\n\nTicket purchase is currently disabled in this installation.")
-        return
-
-    if command == "/tickets":
-        with db() as con:
-            rows = con.execute("SELECT t.public_code,t.draw_id,d.title,t.created_at FROM tickets t JOIN draws d ON d.id=t.draw_id WHERE t.telegram_user_id=? ORDER BY t.id DESC LIMIT 50", (user_id,)).fetchall()
         if not rows:
-            await send_message(chat_id, "You don't have any tickets recorded on this account.")
-        else:
-            await send_message(chat_id, "Your tickets:\n" + "\n".join(f"{r['public_code']} — draw #{r['draw_id']} {r['title']}" for r in rows))
+            send_message(chat_id, "You do not have any tickets yet.", main_keyboard())
+            return
+
+        lines = []
+        for r in rows:
+            outcome = ""
+            if r["winning_number"]:
+                outcome = " | WINNER" if r["number"] == r["winning_number"] else " | not winner"
+            lines.append(
+                f"{r['ticket_code']} — {r['title']} — #{r['number']} — {r['status']}{outcome}"
+            )
+        send_message(chat_id, "YOUR LAST TICKETS\n" + "\n".join(lines), main_keyboard())
         return
 
-    if command == "/admin":
-        if not is_admin(user_id):
-            await send_message(chat_id, "This command is for administrators only.")
+    if text in ["/buy", "🎟 Buy demo ticket"]:
+        rows = active_draws()
+        if not rows:
+            send_message(chat_id, "No open draws are available. Check back later.", main_keyboard())
             return
-        await send_message(chat_id,
-            "Admin commands:\n/newdraw TITLE | PRICE_ETB | PRIZE DESCRIPTION\n/draws — list draws\n/closedraw ID — close a draw\n/stats — summary\n\n"
-            "Example: /newdraw Demo draw | 50 | Demonstration prize\nPrices are entered in ETB. This starter does not collect payments or announce live winners.")
+
+        buttons = [
+            [{
+                "text": f"{d['title']} — {d['price']} ETB (demo)",
+                "callback_data": f"buy:{d['id']}",
+            }]
+            for d in rows
+        ]
+        tg(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": "Choose a draw. This creates a demo ticket only; do not send money.",
+                "reply_markup": {"inline_keyboard": buttons},
+            },
+        )
         return
 
-    if command == "/newdraw":
-        if not is_admin(user_id):
-            await send_message(chat_id, "This command is for administrators only.")
-            return
-        parts = text[len("/newdraw"):].strip().split("|")
-        if len(parts) != 3 or not parts[0].strip() or not parts[1].strip() or not parts[2].strip():
-            await send_message(chat_id, "Usage: /newdraw TITLE | PRICE_ETB | PRIZE DESCRIPTION")
-            return
-        try:
-            price_minor = int(round(float(parts[1].strip()) * 100))
-            if price_minor < 0:
-                raise ValueError()
-        except ValueError:
-            await send_message(chat_id, "Price must be a non-negative number, e.g. 50 or 12.50.")
-            return
-        with db() as con:
-            cur = con.execute("INSERT INTO draws(title,ticket_price_minor,currency,prize_description,created_by,created_at) VALUES(?,?,?,?,?,?)",
-                              (parts[0].strip()[:120], price_minor, "ETB", parts[2].strip()[:500], user_id, now_iso()))
-            draw_id = cur.lastrowid
-        audit(user_id, "draw_created", {"draw_id": draw_id, "title": parts[0].strip()})
-        await send_message(chat_id, f"Created draw #{draw_id}. It is visible in /lottery, but ticket sales are disabled until payment integration is approved and implemented.")
+    if text.startswith("/admin"):
+        send_message(
+            chat_id,
+            "Admin controls are available only in the secure web dashboard.",
+            main_keyboard(),
+        )
         return
 
-    if command == "/draws":
-        if not is_admin(user_id):
-            await send_message(chat_id, "This command is for administrators only.")
-            return
-        with db() as con:
-            rows = con.execute("SELECT * FROM draws ORDER BY id DESC LIMIT 50").fetchall()
-        await send_message(chat_id, "No draws yet." if not rows else "Draws:\n\n" + "\n\n".join(draw_summary(r) for r in rows))
+    send_message(
+        chat_id,
+        "Please choose an option from the menu or use /rules, /draws, /mytickets, /buy.",
+        main_keyboard(),
+    )
+
+
+def handle_callback(update):
+    cb = update.get("callback_query", {})
+    data = cb.get("data", "")
+    user = cb.get("from", {})
+    message = cb.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+
+    if cb.get("id"):
+        tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
+
+    if not data.startswith("buy:") or not user.get("id") or not chat_id:
         return
 
-    if command == "/closedraw":
-        if not is_admin(user_id):
-            await send_message(chat_id, "This command is for administrators only.")
-            return
-        args = text.split(maxsplit=1)
-        if len(args) != 2 or not args[1].isdigit():
-            await send_message(chat_id, "Usage: /closedraw ID")
-            return
-        draw_id = int(args[1])
-        with db() as con:
-            cur = con.execute("UPDATE draws SET status='closed' WHERE id=? AND status='open'", (draw_id,))
-        if cur.rowcount:
-            audit(user_id, "draw_closed", {"draw_id": draw_id})
-            await send_message(chat_id, f"Draw #{draw_id} closed. No winner has been selected.")
-        else:
-            await send_message(chat_id, "Open draw not found.")
-        return
-
-    if command == "/stats":
-        if not is_admin(user_id):
-            await send_message(chat_id, "This command is for administrators only.")
-            return
-        with db() as con:
-            draws = con.execute("SELECT COUNT(*) n FROM draws").fetchone()["n"]
-            tickets = con.execute("SELECT COUNT(*) n FROM tickets").fetchone()["n"]
-            payments = con.execute("SELECT COUNT(*) n FROM payments WHERE status='paid'").fetchone()["n"]
-        await send_message(chat_id, f"Database summary\nDraws: {draws}\nTickets: {tickets}\nVerified paid transactions: {payments}\nPayment collection is disabled by default.")
-        return
-
-    await send_message(chat_id, "I didn't recognize that command. Send /help for available commands.")
-
-
-@app.get("/")
-async def root():
-    return {"service": "telegram-lottery-bot", "status": "ok", "payments_enabled": TELEBIRR_ENABLED, "live_draws_enabled": LIVE_DRAWS_ENABLED}
-
-
-@app.get("/health")
-async def health():
-    with db() as con:
-        con.execute("SELECT 1").fetchone()
-    return {"ok": True, "database": "ok"}
-
-
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)):
-    if not WEBHOOK_SECRET:
-        raise HTTPException(status_code=503, detail="TELEGRAM_WEBHOOK_SECRET is not configured")
-    if not x_telegram_bot_api_secret_token or not hmac.compare_digest(x_telegram_bot_api_secret_token, WEBHOOK_SECRET):
-        raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
     try:
-        update = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        draw_id = int(data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        app.logger.warning("Invalid ticket callback data")
+        return
+
+    con = None
     try:
-        await handle_update(update)
-    except Exception:
-        log.exception("Failed to handle Telegram update update_id=%s", update.get("update_id"))
-        # Telegram receives an HTTP response; inspect app logs for command failures.
-        return JSONResponse({"ok": False}, status_code=500)
-    return {"ok": True}
+        pid = player_upsert(user)
+        con = db()
+        draw = con.execute(
+            "SELECT * FROM draws WHERE id=? AND status='open' AND closes_at>?",
+            (draw_id, now_iso()),
+        ).fetchone()
 
-
-@app.post("/payments/telebirr/callback")
-async def telebirr_callback(request: Request):
-    # Deliberately fail closed: do not issue tickets from an unverified callback.
-    if not TELEBIRR_ENABLED:
-        raise HTTPException(status_code=503, detail="Telebirr payments are disabled")
-    # Enabling the env var alone is not sufficient. Add the official provider's
-    # signature verification and server-to-server transaction status lookup first.
-    raise HTTPException(status_code=501, detail="Provider-specific verification is not implemented")
-
-
-@app.post("/admin/dev/issue-test-ticket")
-async def issue_test_ticket(request: Request, x_admin_key: Optional[str] = Header(default=None)):
-    """Local testing only; disabled unless DEV_ADMIN_KEY is explicitly configured."""
-    key = os.getenv("DEV_ADMIN_KEY", "")
-    if not key or not x_admin_key or not hmac.compare_digest(key, x_admin_key):
-        raise HTTPException(status_code=404, detail="Not found")
-    if os.getenv("APP_ENV", "production").lower() == "production":
-        raise HTTPException(status_code=403, detail="Disabled in production")
-    payload = await request.json()
-    user_id = int(payload["telegram_user_id"])
-    draw_id = int(payload["draw_id"])
-    with db() as con:
-        draw = con.execute("SELECT * FROM draws WHERE id=? AND status='open'", (draw_id,)).fetchone()
         if not draw:
-            raise HTTPException(status_code=404, detail="Open draw not found")
-        code = "TEST-" + secrets.token_hex(5).upper()
-        con.execute("INSERT INTO tickets(public_code,draw_id,telegram_user_id,created_at) VALUES(?,?,?,?)", (code, draw_id, user_id, now_iso()))
-    audit(user_id, "test_ticket_issued", {"draw_id": draw_id, "ticket": code})
-    return {"ok": True, "ticket": code, "test_only": True}
+            con.close()
+            send_message(chat_id, "This draw is closed or unavailable.", main_keyboard())
+            return
+
+        used = {
+            r["number"] for r in con.execute(
+                "SELECT number FROM tickets WHERE draw_id=?", (draw_id,)
+            ).fetchall()
+        }
+        if len(used) >= 1_000_000:
+            con.close()
+            send_message(chat_id, "This draw has reached its ticket-number capacity.", main_keyboard())
+            return
+
+        candidate = secrets.randbelow(1_000_000)
+        while f"{candidate:06d}" in used:
+            candidate = secrets.randbelow(1_000_000)
+
+        number = f"{candidate:06d}"
+        code = "ETL-" + secrets.token_hex(4).upper()
+
+        cur = con.execute(
+            "INSERT INTO tickets(ticket_code,draw_id,player_id,number,status,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (code, draw_id, pid, number, "DEMO", now_iso()),
+        )
+        ticket_id = cur.lastrowid
+        con.execute(
+            "INSERT INTO ledger(entry_type,amount,currency,status,reference,player_id,ticket_id,"
+            "notes,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "demo_ticket", draw["price"], "ETB", "DEMO_ONLY",
+                "DEMO-" + code, pid, ticket_id,
+                "Not a real payment; no money collected.", now_iso(), "system"
+            ),
+        )
+        title, price = draw["title"], draw["price"]
+        con.commit()
+        con.close()
+        con = None
+
+        send_message(
+            chat_id,
+            f"DEMO TICKET RECEIPT\nTicket ID: {code}\nDraw: {title}\n"
+            f"Number: {number}\nDisplayed price: {price} ETB\n"
+            f"Payment: NONE — DEMO ONLY\nCreated: {now_iso()}\n"
+            "Keep this receipt. Use /mytickets to check it.",
+            main_keyboard(),
+        )
+
+    except sqlite3.IntegrityError:
+        app.logger.exception("Database constraint error creating demo ticket")
+        if con:
+            con.rollback()
+            con.close()
+        send_message(chat_id, "A conflict occurred. Please try again.", main_keyboard())
+    except Exception:
+        app.logger.exception("Unexpected error handling ticket callback")
+        if con:
+            con.rollback()
+            con.close()
+        send_message(chat_id, "Sorry, the demo ticket could not be created.", main_keyboard())
 
 
-@app.on_event("startup")
-async def startup_log():
-    log.info("Lottery bot started payments_enabled=%s live_draws_enabled=%s db=%s", TELEBIRR_ENABLED, LIVE_DRAWS_ENABLED, DB_PATH)
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    if not WEBHOOK_SECRET:
+        app.logger.error("WEBHOOK_SECRET is not configured")
+        abort(403)
+
+    provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(provided_secret, WEBHOOK_SECRET):
+        app.logger.warning("Webhook rejected: secret token mismatch")
+        abort(403)
+
+    update = request.get_json(silent=True) or {}
+    app.logger.info("Telegram update received; keys=%s", list(update.keys()))
+
+    try:
+        if "callback_query" in update:
+            handle_callback(update)
+        else:
+            handle_update(update)
+    except Exception:
+        app.logger.exception("Unhandled error processing Telegram update")
+
+    return {"ok": True}, 200
+
+
+@app.route("/health")
+def health():
+    return {
+        "ok": True,
+        "mode": "DEMO" if DEMO_MODE else "CONFIGURED",
+        "service": "Ethio Lottery",
+    }, 200
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin_id"):
+            return redirect(url_for("login"))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def csrf_token():
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_urlsafe(24)
+    return session["csrf"]
+
+
+@app.context_processor
+def inject_helpers():
+    return {"csrf_token": csrf_token, "demo_mode": DEMO_MODE}
+
+
+def check_csrf():
+    if not session.get("csrf") or not hmac.compare_digest(
+        session.get("csrf", ""), request.form.get("csrf", "")
+    ):
+        abort(400, "Invalid form token")
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        check_csrf()
+        username = request.form.get("username", "")[:100]
+        password = request.form.get("password", "")
+
+        con = db()
+        row = con.execute(
+            "SELECT * FROM admins WHERE username=? AND active=1", (username,)
+        ).fetchone()
+        con.close()
+
+        if row and check_password_hash(row["password_hash"], password):
+            session.clear()
+            session["admin_id"] = row["id"]
+            session["username"] = row["username"]
+            session["role"] = row["role"]
+            session.permanent = True
+            audit(username, "admin_login", "admin", row["id"])
+            return redirect(url_for("dashboard"))
+
+        audit(username or "unknown", "admin_login_failed", "admin", None)
+        flash("Login failed. Check credentials.", "error")
+
+    return render_template("login.html")
+
+
+@app.route("/admin/logout", methods=["POST"])
+@admin_required
+def logout():
+    check_csrf()
+    audit(session.get("username", "admin"), "admin_logout", "admin", session.get("admin_id"))
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/admin")
+@admin_required
+def dashboard():
+    con = db()
+    counts = {
+        "players": con.execute("SELECT COUNT(*) FROM players").fetchone()[0],
+        "tickets": con.execute("SELECT COUNT(*) FROM tickets").fetchone()[0],
+        "draws": con.execute("SELECT COUNT(*) FROM draws").fetchone()[0],
+        "open_draws": con.execute("SELECT COUNT(*) FROM draws WHERE status='open'").fetchone()[0],
+    }
+    ledger = con.execute(
+        "SELECT entry_type,status,COUNT(*) AS n,COALESCE(SUM(amount),0) AS amount "
+        "FROM ledger GROUP BY entry_type,status ORDER BY entry_type"
+    ).fetchall()
+    draws = con.execute(
+        "SELECT d.*, (SELECT COUNT(*) FROM tickets t WHERE t.draw_id=d.id) AS ticket_count "
+        "FROM draws d ORDER BY d.id DESC LIMIT 30"
+    ).fetchall()
+    audit_rows = con.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 15").fetchall()
+    con.close()
+    return render_template(
+        "dashboard.html", counts=counts, ledger=ledger, draws=draws, audit_rows=audit_rows
+    )
+
+
+@app.route("/admin/draws/create", methods=["POST"])
+@admin_required
+def create_draw():
+    check_csrf()
+    kind = request.form.get("draw_type", "daily")
+    title = request.form.get("title", "").strip()[:100]
+    price = PRICES.get(kind)
+
+    try:
+        close = datetime.fromisoformat(
+            request.form.get("closes_at", "")
+        ).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        flash("Enter a valid closing date/time.", "error")
+        return redirect(url_for("dashboard"))
+
+    if not title or not price or close <= datetime.now(timezone.utc):
+        flash("Choose a draw type, title, and future closing time.", "error")
+        return redirect(url_for("dashboard"))
+
+    con = db()
+    cur = con.execute(
+        "INSERT INTO draws(draw_type,title,price,status,closes_at,created_at) VALUES(?,?,?,?,?,?)",
+        (kind, title, price, "open", close.isoformat(timespec="seconds"), now_iso()),
+    )
+    draw_id = cur.lastrowid
+    con.commit()
+    con.close()
+    audit(
+        session.get("username", "admin"), "draw_created", "draw", draw_id,
+        {"type": kind, "title": title, "price": price, "closes_at": close.isoformat()}
+    )
+    flash("Demo draw created.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/admin/draw/<int:draw_id>/close", methods=["POST"])
+@admin_required
+def close_draw(draw_id):
+    check_csrf()
+    con = db()
+    row = con.execute("SELECT * FROM draws WHERE id=?", (draw_id,)).fetchone()
+    if not row or row["status"] != "open":
+        con.close()
+        flash("Draw not found or not open.", "error")
+        return redirect(url_for("dashboard"))
+
+    con.execute(
+        "UPDATE draws SET status='closed',closed_at=? WHERE id=?",
+        (now_iso(), draw_id),
+    )
+    con.commit()
+    con.close()
+    audit(session.get("username", "admin"), "draw_closed", "draw", draw_id)
+    flash("Draw closed. You may now run the demo draw.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/admin/draw/<int:draw_id>/run", methods=["POST"])
+@admin_required
+def run_draw(draw_id):
+    check_csrf()
+    con = db()
+    row = con.execute(
+        "SELECT * FROM draws WHERE id=? AND status='closed'", (draw_id,)
+    ).fetchone()
+    if not row:
+        con.close()
+        flash("Close the draw before selecting a winning number.", "error")
+        return redirect(url_for("dashboard"))
+
+    seed = secrets.token_bytes(32)
+    commitment = hashlib.sha256(seed).hexdigest()
+    modulus = 1_000_000
+    limit = (1 << 256) - ((1 << 256) % modulus)
+    counter = 0
+    while True:
+        digest = hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+        value = int.from_bytes(digest, "big")
+        if value < limit:
+            break
+        counter += 1
+
+    number = f"{value % modulus:06d}"
+    con.execute(
+        "UPDATE draws SET status='drawn',winning_number=?,seed_commitment=?,seed_reveal=?,drawn_at=? "
+        "WHERE id=? AND status='closed'",
+        (number, commitment, seed.hex(), now_iso(), draw_id),
+    )
+    con.commit()
+    count = con.execute(
+        "SELECT COUNT(*) FROM tickets WHERE draw_id=? AND number=?", (draw_id, number)
+    ).fetchone()[0]
+    con.close()
+    audit(
+        session.get("username", "admin"), "demo_draw_run", "draw", draw_id,
+        {"winning_number": number, "seed_commitment": commitment, "matched_tickets": count}
+    )
+    flash(
+        f"DEMO result: {number}. Matching tickets: {count}. No real prize payout is enabled.",
+        "success",
+    )
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/admin/settings", methods=["GET", "POST"])
+@admin_required
+def settings():
+    con = db()
+    if request.method == "POST":
+        check_csrf()
+        policy = request.form.get("draw_policy", "").strip()[:1000]
+        if policy:
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES('draw_policy',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (policy,),
+            )
+            con.commit()
+            audit(
+                session.get("username", "admin"), "settings_updated",
+                "settings", "draw_policy", {"value": policy}
+            )
+            flash("Rules setting saved. Review terms before any public launch.", "success")
+
+    rows = con.execute("SELECT key,value FROM settings ORDER BY key").fetchall()
+    con.close()
+    return render_template("settings.html", settings=rows)
+
+
+@app.route("/admin/ledger")
+@admin_required
+def ledger_page():
+    con = db()
+    rows = con.execute("SELECT * FROM ledger ORDER BY id DESC LIMIT 200").fetchall()
+    con.close()
+    return render_template("ledger.html", rows=rows)
+
+
+@app.route("/admin/tickets")
+@admin_required
+def tickets_page():
+    con = db()
+    rows = con.execute(
+        "SELECT t.*,p.telegram_id,p.username,d.title FROM tickets t "
+        "JOIN players p ON p.id=t.player_id JOIN draws d ON d.id=t.draw_id "
+        "ORDER BY t.id DESC LIMIT 300"
+    ).fetchall()
+    con.close()
+    return render_template("tickets.html", rows=rows)
+
+
+@app.route("/admin/players")
+@admin_required
+def players_page():
+    con = db()
+    rows = con.execute(
+        "SELECT p.*,COUNT(t.id) AS tickets_count FROM players p "
+        "LEFT JOIN tickets t ON t.player_id=p.id GROUP BY p.id "
+        "ORDER BY p.id DESC LIMIT 300"
+    ).fetchall()
+    con.close()
+    return render_template("players.html", rows=rows)
+
+
+@app.errorhandler(400)
+def bad_request(error):
+    return render_template(
+        "error.html", message=getattr(error, "description", "Bad request")
+    ), 400
+
+
+@app.errorhandler(403)
+def forbidden(error):
+    return render_template("error.html", message="Forbidden"), 403
+
+
+with app.app_context():
+    init_db()
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+
     if not BOT_TOKEN:
         log.warning("BOT_TOKEN is missing")
     if not ADMIN_IDS:
