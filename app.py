@@ -139,9 +139,9 @@ def handle_callback(update):
 
 @app.route('/telegram/webhook', methods=['POST'])
 def telegram_webhook():
-    app.logger.info("Telegram update received; keys=%s", list(update.keys()))
     if not WEBHOOK_SECRET or not hmac.compare_digest(request.headers.get('X-Telegram-Bot-Api-Secret-Token',''),WEBHOOK_SECRET): abort(403)
     update=request.get_json(silent=True) or {}
+    app.logger.info("Telegram update received; keys=%s", list(update.keys()))
     if 'callback_query' in update: handle_callback(update)
     else: handle_update(update)
     return {'ok':True}
