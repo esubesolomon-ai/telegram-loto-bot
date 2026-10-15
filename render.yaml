@@ -13,8 +13,8 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_WEBHOOK_SECRET
-        generateValue: true
+      - - key: WEBHOOK_SECRET
+         sync: false
       - key: ADMIN_IDS
         sync: false
       - key: DB_PATH
